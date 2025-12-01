@@ -2,7 +2,7 @@ from sqlalchemy.orm import Session
 from app.models.case import Case, CaseStatus
 from app.schemas.case import CaseCreate, CaseUpdate, CaseFromPDF
 from typing import Optional
-
+from sqlalchemy import desc
 
 def get_case(db: Session, case_id: int):
     """Get a single case by ID"""
@@ -10,15 +10,22 @@ def get_case(db: Session, case_id: int):
 
 
 def get_cases(
-    db: Session,
-    skip: int = 0,
-    limit: int = 100,
-    status: Optional[CaseStatus] = None
+        db: Session,
+        skip: int = 0,
+        limit: int = 100,
+        status: Optional[CaseStatus] = None
 ):
-    """Get all cases with optional filtering by status"""
+    """Get all cases with optional filtering by status, ordered by creation date (newest first)"""
     query = db.query(Case)
+
+    # 1. Фильтрация по статусу (если указан)
     if status:
         query = query.filter(Case.status == status)
+
+    # 2. Сортировка по created_at в убывающем порядке (DESC)
+    query = query.order_by(desc(Case.created_at))
+
+    # 3. Применение пагинации и выполнение запроса
     return query.offset(skip).limit(limit).all()
 
 
