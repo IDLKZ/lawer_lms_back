@@ -379,7 +379,7 @@ def delete_case(
 
 
 @router.post("/{case_id}/generate-questions", response_model=List[CaseTestResponse])
-def generate_questions_for_case(
+async def generate_questions_for_case(
     case_id: int,
     count: int = Query(default=5, ge=1, le=20, description="Number of questions to generate"),
     field_of_law: str = Query(default="уголовный процесс", description="Area of law"),
@@ -392,7 +392,10 @@ def generate_questions_for_case(
     """
     Generate educational questions for a case using LLM (openai/gpt-5.1).
 
-    This endpoint creates detailed questions with comprehensive answers (300-700 words)
+    ⚠️ **Note**: This operation may take 30-60 seconds depending on the number of questions
+    and case complexity. Make sure your client timeout is set appropriately (at least 120 seconds).
+
+    This endpoint creates detailed questions with comprehensive answers (100-300 words)
     suitable for legal education.
 
     The endpoint:
