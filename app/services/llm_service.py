@@ -1,367 +1,693 @@
-import json
 import logging
-import re
-from typing import List, Dict, Any
+import requests
+from typing import Dict, Optional, Literal
+import json
 from openai import OpenAI
-from app.core.config import settings
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Initialize OpenAI client
-client = OpenAI(api_key=settings.OPENAI_API_KEY)
+
+# Provider type
+ProviderType = Literal["ollama", "openrouter", "openai", "groq", "cloud"]
 
 
-def _parse_situational_tests(response_text: str) -> List[Dict[str, Any]]:
+# Simplified prompt for LLM (after NER preprocessing)
+LLM_FINALIZATION_PROMPT = """РОЛЬ: Ты — эксперт по **художественной анонимизации** юридических документов на русском и казахском языках. Твоя задача — заменить все конфиденциальные данные **вымышленными, но реалистичными** аналогами.
+
+ВАЖНО: ТЕКСТ УЖЕ ПРЕДВАРИТЕЛЬНО ОЧИЩЕН NER-системой. Большинство ФИО, номеров и адресов уже заменены на плейсхолдеры ([ЛИЦО-1], [ОРГ-1], [ТЕЛЕФОН], [EMAIL] и т.д.).
+
+ТВОЯ ЗАДАЧА:
+1. **Заменить ВСЕ плейсхолдеры** ([ЛИЦО-X], [ОРГ-X], [ГЕО-X], [АДРЕС-X] и т.д.) на **вымышленные сущности**.
+2. Найти и заменить ОСТАВШИЕСЯ (пропущенные NER) конфиденциальные данные, также используя вымышленные аналоги.
+3. Обеспечить юридическую и лингвистическую целостность текста.
+4. Исправить разорванные слова.
+
+ПРАВИЛА ЗАМЕНЫ НА ВЫМЫШЛЕННЫЕ ДАННЫЕ:
+
+1. ЛИЦА (РУ/КЗ):
+   * Заменяй **[ЛИЦО-X]** на **полное вымышленное ФИО** (например, Иван Смирнов, Қайрат Асқарұлы).
+   * Если требуется только фамилия, используй только вымышленную фамилию (Смирнов, Асқарұлы).
+   * **Сохраняй национальную принадлежность:** Русские имена заменяй на русские, казахские – на казахские.
+   * **Последовательность:** Одно и то же [ЛИЦО-X] должно быть заменено на одно и то же вымышленное ФИО по всему документу.
+
+2. ОРГАНИЗАЦИИ (РУ/КЗ):
+   * Заменяй **[ОРГ-X]** на **вымышленное, но правдоподобное** название (например, "Общество с ограниченной ответственностью 'Альфа-Плюс'", "ЖШС 'Көкжиек Консалтинг'").
+   * Сохраняй тип организации (Суд $\rightarrow$ Вымышленный Суд, Полиция $\rightarrow$ Вымышленный Отдел Полиции).
+
+3. ГЕОГРАФИЯ И АДРЕСА (РУ/КЗ):
+   * Заменяй **[ГЕО-X]** на **вымышленный город/область** (например, "город Заречный", "Отырар облысы").
+   * Заменяй **[АДРЕС-X]** на **полный вымышленный адрес** (например, "улица Мирная, дом 15, квартира 4", "Әл-Фараби даңғылы, 8-үй").
+
+4. ДРУГИЕ ДАННЫЕ:
+   * **[ТЕЛЕФОН], [EMAIL], [НОМЕР_ДЕЛА] и т.д.:** Заменяй на **правдоподобные вымышленные аналоги** (например, +7-707-123-45-67, a.smirnov@fakecorp.kz, ДЕЛО №456/2025).
+
+5. Инициалы в подписи (/А.А./) → Используй инициалы вымышленного лица.
+
+НЕ ИЗМЕНЯТЬ:
+* Юридическая терминология (статья 175, Қылмыстық кодекс, УК РК и т.д.)
+* Структура документа, абзацы, нумерация.
+* Общие должности без имен (прокурор, тергеуші, судья).
+* Временные рамки и сроки процедур.
+* **ДАТЫ:** Если [ДАТА_РОЖДЕНИЯ], заменяй на вымышленную дату. Остальные даты (событий) сохраняй, если они важны для хронологии.
+
+ОБЯЗАТЕЛЬНО:
+* Склеивай разорванные слова: «заңб ұзушылық» → «заңбұзушылық», «қай та» → «қайта».
+* Сохраняй оба языка, если документ двуязычный.
+* НЕ переводи текст с одного языка на другой.
+* Проверь грамматическую целостность казахского и русского.
+
+ФОРМАТ ОТВЕТА: Верни ТОЛЬКО очищенный и заполненный вымышленными данными текст без комментариев.
+
+ТЕКСТ:
+
+{text}"""
+
+# Full prompt for direct LLM cleaning (without NER - legacy support)
+CLEANING_PROMPT = """Ты — эксперт по анонимизации юридических документов на русском и казахском языках. Твоя задача — полностью очистить предоставленный текст от всех персональных и конфиденциальных данных, сохранив структуру, смысл и юридическую терминологию документа.
+
+ВАЖНО: Документ может быть на русском языке, казахском языке, или содержать оба языка. Обрабатывай персональные данные на обоих языках одинаково.
+
+ПРАВИЛА ЗАМЕНЫ:
+
+1. ЛИЧНЫЕ ДАННЫЕ (РУССКИЙ И КАЗАХСКИЙ):
+   РУССКИЕ ИМЕНА:
+   - ФИО полностью (Иванов Иван Иванович) → "Гражданин А."
+   - Только фамилия (Иванов) → "Гражданин Б."
+   - Имя и отчество без фамилии → "Гражданин В."
+   - Инициалы (И.И. Иванов, Иванов И.И.) → "Гражданин Г."
+   - Должности с именами (капитан Иванов, лейтенант Петров) → "Капитан Д.", "Лейтенант Е."
+
+   КАЗАХСКИЕ ИМЕНА:
+   - ФИО полностью (Нұрболат Әлі Серікұлы) → "Азамат А."
+   - Только фамилия/имя (Нұрболат, Серікұлы) → "Азамат Б."
+   - С указанием должности (капитан Әлі, аға лейтенант Серік) → "Капитан В.", "Аға лейтенант Г."
+   - Инициалы (Н.Ә. Серікұлы) → "Азамат Д."
+   - Казахские отчества (улы, қызы) → заменять вместе с ФИО
+
+   ДВУЯЗЫЧНЫЕ ФОРМЫ:
+   - Если имя указано на двух языках (Иванов/Иванов, Нұрболат/Нурболат) → заменять оба варианта на один плейсхолдер
+   - Используй последовательные буквы русского алфавита (А., Б., В., Г., Д., Е., Ж., З. и т.д.)
+
+2. ДОЛЖНОСТИ И ЗВАНИЯ (РУССКИЙ И КАЗАХСКИЙ):
+   РУССКИЙ:
+   - "Начальник отдела полиции Иванов" → "Начальник отдела полиции Ж."
+   - "Прокурор Петров" → "Прокурор З."
+   - "Дежурный офицер Сидоров" → "Дежурный офицер И."
+
+   КАЗАХСКИЙ:
+   - "Полиция бөлімінің бастығы Нұрболат" → "Полиция бөлімінің бастығы К."
+   - "Прокурор Әлі" → "Прокурор Л."
+   - "Кезекші офицер Серік" → "Кезекші офицер М."
+
+3. ОРГАНИЗАЦИИ (РУССКИЙ И КАЗАХСКИЙ):
+   РУССКИЙ:
+   - Конкретные названия (МВД РФ по городу Москва) → "Организация А."
+   - Отделения полиции (ОМВД России по району Х) → "Организация Б."
+   - Суды (Московский районный суд) → "Организация В."
+   - Частные компании → "Организация Г.", "Организация Д." и т.д.
+
+   КАЗАХСКИЙ:
+   - Конкретные названия (Алматы қаласы ІІМ) → "Ұйым А." или "Организация А."
+   - Отделения полиции (Қарасай ауданы ІІБ) → "Ұйым Б." или "Организация Б."
+   - Суды (Алматы қалалық соты) → "Ұйым В." или "Организация В."
+   - Частные компании → "Ұйым Г.", "Ұйым Д." или использовать "Организация..."
+
+   ВАЖНО: Для организаций можешь использовать русские плейсхолдеры "Организация А." даже если текст на казахском
+
+4. ГЕОГРАФИЧЕСКИЕ ДАННЫЕ (РУССКИЙ И КАЗАХСКИЙ):
+   РУССКИЙ:
+   - Точные адреса (ул. Ленина, д. 5, кв. 10) → "адрес №1"
+   - Города (если не критичны для понимания) → "город А."
+   - Регионы → "регион Б."
+   - Конкретные места преступлений → "место происшествия №1"
+
+   КАЗАХСКИЙ:
+   - Точные адреса (Абай көшесі, 5-үй, 10-пәтер) → "мекенжай №1" или "адрес №1"
+   - Города (Алматы, Астана, Шымкент) → "қала А." или "город А."
+   - Регионы (Алматы облысы) → "облыс Б." или "регион Б."
+   - Места происшествий (оқиға орны) → "оқиға орны №1" или "место происшествия №1"
+
+   ВАЖНО: Можешь использовать русские плейсхолдеры даже для казахских географических названий
+
+5. КОНТАКТНЫЕ ДАННЫЕ:
+   - Телефоны (+7-XXX-XXX-XX-XX) → "[ТЕЛЕФОН]"
+   - Email (ivanov@example.com) → "[EMAIL]"
+
+6. ДОКУМЕНТЫ И НОМЕРА (РУССКИЙ И КАЗАХСКИЙ):
+   - Серии и номера паспортов → "[ПАСПОРТ]" или "[ТӨЛҚҰЖАТ]"
+   - СНИЛС → "[СНИЛС]"
+   - ИНН / ИИН / ЖСН (Жеке Сәйкестендіру Нөмірі) → "[ИНН]" или "[ЖСН]"
+   - БИН (Бизнес Идентификационный Номер) → "[БИН]"
+   - Номера дел → "[ДЕЛО №XXX]" или "[ІС №XXX]"
+   - Номера постановлений → "[ПОСТАНОВЛЕНИЕ №XXX]" или "[ҚАУЛЫ №XXX]"
+   - Удостоверения (куәлік) → "[УДОСТОВЕРЕНИЕ]" или "[КУӘЛІК]"
+
+7. ДАТЫ:
+   - Даты рождения → "[ДАТА РОЖДЕНИЯ]"
+   - Конкретные даты событий можно сохранить, если они важны для хронологии (например, "15 января 2024 года")
+
+8. СПЕЦИФИЧЕСКИЕ ДЕТАЛИ:
+   - Номера автомобилей → "[ГОСНОМЕР]"
+   - Банковские счета → "[СЧЕТ]"
+   - Номера кредитных карт → "[КАРТА]"
+
+ВАЖНО:
+- НЕ изменяй юридическую терминологию и формулировки (на русском И на казахском языках)
+- Сохраняй структуру документа (абзацы, списки, нумерацию)
+- Сохраняй ссылки на законы, статьи, нормативные акты БЕЗ ИЗМЕНЕНИЙ на обоих языках
+  Примеры: "Уголовный кодекс РК", "Қылмыстық кодекс", "статья 175", "175-бап"
+- Сохраняй общие должности без привязки к конкретным лицам:
+  Русский: "прокурор", "следователь", "судья", "дежурный"
+  Казахский: "прокурор", "тергеуші", "судья", "кезекші"
+- Сохраняй временные рамки и сроки на обоих языках
+- Будь последовательным: одно и то же лицо должно заменяться на одну и ту же букву в пределах документа
+- Если документ двуязычный, сохраняй оба языка после замены персональных данных
+- Если сомневаешься, лучше заменить данные, чем оставить их
+- НЕ переводи документ с одного языка на другой, сохраняй язык оригинала
+- Исправление разрывов слов: После замены проверяй и склеивай разорванные казахские/русские слова (например, «заңб ұзушылық» → «заңбұзушылық», «қай та» → «қайта»). Сохраняй дефисы только в составных словах.
+- Обработка организаций: Все конкретные названия компаний/учреждений (даже с датами вроде "-2020") заменяй на "Организация А.", "Ұйым А." последовательно в документе.
+- Подпись в конце: Инициалы в подписи («/А.М./») → «/А.А./» или "[ПОДПИСЬ]".
+- Валидация текста: Финальный шаг — проверка на грамматическую/орфографическую целостность казахского и русского без изменения смысла.
+
+ФОРМАТ ОТВЕТА:
+Верни ТОЛЬКО очищенный текст без каких-либо комментариев, пояснений или дополнительного форматирования. Просто замени данные и верни результат.
+
+ТЕКСТ ДЛЯ ОЧИСТКИ:
+
+{text}"""
+
+
+def clean_text_with_ollama(
+    text: str,
+    ollama_url: str = "http://localhost:11434",
+    model: str = "llama3",
+    temperature: float = 0.1
+) -> Dict[str, any]:
     """
-    Parse situational test format into JSON structure.
-
-    Expected format:
-    Ситуация 1
-    [situation text]
-    Вопрос: [question]
-    Варианты ответов:
-    A) option1
-    B) option2
-    C) option3
-    D) option4
-    Правильный ответ: [letter].
-    """
-    questions = []
-
-    # Split by "Ситуация" and skip the first empty element
-    situations = re.split(r'Ситуация \d+', response_text)
-    situations = [s.strip() for s in situations if s.strip()]
-
-    for situation_block in situations:
-        try:
-            # Extract question
-            question_match = re.search(r'Вопрос:\s*(.+?)(?=Варианты ответов:)', situation_block, re.DOTALL)
-            if not question_match:
-                continue
-
-            situation_text = situation_block[:question_match.start()].strip()
-            question_text = question_match.group(1).strip()
-
-            # Combine situation and question
-            full_question = f"{situation_text}\n\n{question_text}"
-
-            # Extract options
-            options_match = re.search(r'Варианты ответов:\s*A\)\s*(.+?)\s*B\)\s*(.+?)\s*C\)\s*(.+?)\s*D\)\s*(.+?)(?=Правильный ответ:)',
-                                     situation_block, re.DOTALL)
-            if not options_match:
-                continue
-
-            options = [
-                options_match.group(1).strip(),
-                options_match.group(2).strip(),
-                options_match.group(3).strip(),
-                options_match.group(4).strip()
-            ]
-
-            # Extract correct answer letter
-            correct_match = re.search(r'Правильный ответ:\s*([A-D])', situation_block)
-            if not correct_match:
-                continue
-
-            correct_letter = correct_match.group(1)
-            letter_to_index = {'A': 0, 'B': 1, 'C': 2, 'D': 3}
-            correct_answer = options[letter_to_index[correct_letter]]
-
-            questions.append({
-                "question": full_question,
-                "options": options,
-                "correct_answer": correct_answer
-            })
-
-        except Exception as e:
-            logger.error(f"Error parsing situation block: {str(e)}")
-            continue
-
-    return questions
-
-
-def generate_summary(text: str = None, file_url: str = None, max_tokens: int = 1000) -> str:
-    """
-    Generate a summary from the given text or file using OpenAI API.
+    Clean personal data from text using Ollama LLM.
 
     Args:
-        text: The original text to summarize (optional)
-        file_url: URL to the file to summarize (optional)
-        max_tokens: Maximum number of tokens in the response
+        text: The text to clean
+        ollama_url: URL of the Ollama server
+        model: Name of the Ollama model to use
+        temperature: Temperature for generation (lower = more deterministic)
 
     Returns:
-        str: The generated summary
-
-    Note: Either text or file_url must be provided
+        Dict containing:
+            - cleaned_text: Text with personal data removed/masked
+            - original_length: Length of original text
+            - cleaned_length: Length of cleaned text
+            - llm_model: Name of the model used
+            - success: Whether the operation was successful
     """
-    if not text and not file_url:
-        raise ValueError("Either text or file_url must be provided")
-
     try:
-        # Prompt for summarization
-        prompt_text = """Создай краткий и структурированный конспект на русском языке из предоставленного материала.
+        logger.info(f"Starting text cleaning with Ollama model: {model}")
+        logger.info(f"Original text length: {len(text)} characters")
 
-Конспект должен быть:
-- Кратким и информативным (примерно на 1 страницу)
-- Хорошо структурированным с заголовками и подзаголовками
-- Содержать ключевые моменты и важную информацию
-- Написан простым и понятным языком"""
+        # Prepare the prompt
+        prompt = CLEANING_PROMPT.format(text=text)
 
-        # If file_url is provided, use responses API with file support
-        if file_url:
-            logger.info(f"Generating summary from file: {file_url}")
+        # Prepare the request to Ollama
+        url = f"{ollama_url}/api/generate"
+        payload = {
+            "model": model,
+            "prompt": prompt,
+            "stream": False,
+            "options": {
+                "temperature": temperature,
+                "num_predict": -1  # No limit on output length
+            }
+        }
 
-            response = client.responses.create(
-                model="gpt-5",
-                input=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "input_text",
-                                "text": prompt_text
-                            },
-                            {
-                                "type": "input_file",
-                                "file_url": file_url
-                            }
-                        ]
-                    }
-                ]
-            )
-            summary = response.output_text
+        logger.info(f"Sending request to Ollama at {url}")
 
-        # If text is provided, use standard chat completion
-        else:
-            logger.info(f"Generating summary for text of length: {len(text)}")
+        # Send request to Ollama
+        response = requests.post(url, json=payload, timeout=300)  # 5 minute timeout
+        response.raise_for_status()
 
-            full_prompt = f"{prompt_text}\n\nТекст для конспектирования:\n{text}"
+        # Parse response
+        result = response.json()
+        cleaned_text = result.get("response", "")
 
-            response = client.chat.completions.create(
-                model="gpt-5",
-                messages=[
-                    {"role": "system", "content": "Ты - профессиональный методист, который создает качественные учебные материалы."},
-                    {"role": "user", "content": full_prompt}
-                ],
-                max_tokens=max_tokens
-            )
-            summary = response.choices[0].message.content
+        if not cleaned_text:
+            raise ValueError("Ollama returned empty response")
 
-        if not summary:
-            logger.warning("Received empty summary from OpenAI API")
-            return ""
+        logger.info(f"Cleaned text length: {len(cleaned_text)} characters")
+        logger.info(f"Cleaning completed successfully")
 
-        logger.info(f"Summary generated successfully. Length: {len(summary)}")
-        logger.info(f"Summary content preview: {summary[:200]}...")
-        return summary
+        return {
+            "cleaned_text": cleaned_text.strip(),
+            "original_length": len(text),
+            "cleaned_length": len(cleaned_text.strip()),
+            "llm_model": model,
+            "success": True,
+            "error": None
+        }
+
+    except requests.exceptions.ConnectionError as e:
+        error_msg = f"Failed to connect to Ollama at {ollama_url}. Is Ollama running?"
+        logger.error(f"{error_msg}: {str(e)}")
+        return {
+            "cleaned_text": None,
+            "original_length": len(text),
+            "cleaned_length": 0,
+            "llm_model": model,
+            "success": False,
+            "error": error_msg
+        }
+
+    except requests.exceptions.Timeout as e:
+        error_msg = "Request to Ollama timed out. Try with a shorter text or increase timeout."
+        logger.error(f"{error_msg}: {str(e)}")
+        return {
+            "cleaned_text": None,
+            "original_length": len(text),
+            "cleaned_length": 0,
+            "llm_model": model,
+            "success": False,
+            "error": error_msg
+        }
 
     except Exception as e:
-        logger.error(f"Error generating summary: {str(e)}")
-        raise Exception(f"Failed to generate summary: {str(e)}")
+        error_msg = f"Error during text cleaning: {str(e)}"
+        logger.error(error_msg)
+        return {
+            "cleaned_text": None,
+            "original_length": len(text),
+            "cleaned_length": 0,
+            "llm_model": model,
+            "success": False,
+            "error": error_msg
+        }
 
 
-def generate_test(text: str = None, file_url: str = None, num_questions: int = 5) -> List[Dict[str, Any]]:
+def test_ollama_connection(
+    ollama_url: str = "http://localhost:11434",
+    model: str = "llama3"
+) -> Dict[str, any]:
     """
-    Generate multiple choice questions from the given text or file using OpenAI API.
+    Test connection to Ollama and check if the model is available.
 
     Args:
-        text: The original text to generate questions from (optional)
-        file_url: URL to the file to generate questions from (optional)
-        num_questions: Number of questions to generate
+        ollama_url: URL of the Ollama server
+        model: Name of the model to check
 
     Returns:
-        List[Dict]: List of questions in format:
-            [{question, options: [list of answers], correct_answer: actual answer text}]
-
-    Note: Either text or file_url must be provided
+        Dict with connection status and available models
     """
-    if not text and not file_url:
-        raise ValueError("Either text or file_url must be provided")
-
     try:
-        # Prompt for test generation
-        prompt_text = """Ты — методист по оценочным материалам в юриспруденции и эксперт по нормоконтролю правоохранительных органов. Тебе передают текст прокурорского представления (далее — Документ). Задача: сгенерировать ровно 5 ситуационных тестов на основе содержания Документа. Каждый тест состоит из короткой ситуации, одного вопроса, четырёх вариантов ответов (A–D) и строки «Правильный ответ: [буква]». Объяснения и обоснования не предоставляй.
+        # Test if Ollama is running
+        response = requests.get(f"{ollama_url}/api/tags", timeout=5)
+        response.raise_for_status()
 
-Требования к генерации:
+        models_data = response.json()
+        available_models = [m.get("name", "") for m in models_data.get("models", [])]
 
-Источник фактов и норм — только Документ: извлеки упомянутые нормы права, сроки, процессуальные действия, роли должностных лиц, требования прокурора и меры реагирования. Не добавляй нормы и темы, которых нет в Документе.
+        model_available = any(model in m for m in available_models)
 
-Ситуации должны варьироваться по ролям (например, дежурный офицер, участковый, следователь, руководитель подразделения, прокурор), процессуальным этапам, срокам, видам нарушений и управленческим мерам, но все они должны логично вытекать из Документа.
+        logger.info(f"Ollama connection successful. Available models: {available_models}")
 
-В каждом тесте задавай один чёткий вопрос в стиле: «Что нарушено?», «Какая норма применима?», «Какая мера правомерна?», «Кто обязан совершить действие по Документу?».
-
-Варианты ответов: один корректный и три правдоподобных, но неверных по сути, норме или субъекту; избегай очевидных «пустых» дистракторов.
-
-Персональные данные не раскрывай; используй нейтральные обозначения: «гражданин А.», «лейтенант Б.», «начальник отдела», «прокурор города».
-
-Формат вывода строго как ниже, без дополнительных комментариев, пояснений, заголовков и пустых строк в конце.
-
-Формат вывода (ровно для 5 кейсов):
-Ситуация 1
-[4–7 предложений, описывающих эпизод, в котором обыгрывается конкретная норма/требование из Документа.]
-Вопрос: [1 предложение, чёткий вопрос по сути кейса.]
-Варианты ответов:
-A) …
-B) …
-C) …
-D) …
-Правильный ответ: [буква].
-
-Ситуация 2
-[текст ситуации]
-Вопрос: …
-Варианты ответов:
-A) …
-B) …
-C) …
-D) …
-Правильный ответ: [буква].
-
-Ситуация 3
-[текст ситуации]
-Вопрос: …
-Варианты ответов:
-A) …
-B) …
-C) …
-D) …
-Правильный ответ: [буква].
-
-Ситуация 4
-[текст ситуации]
-Вопрос: …
-Варианты ответов:
-A) …
-B) …
-C) …
-D) …
-Правильный ответ: [буква].
-
-Ситуация 5
-[текст ситуации]
-Вопрос: …
-Варианты ответов:
-A) …
-B) …
-C) …
-D) …
-Правильный ответ: [буква].
-
-Правила качества:
-
-Каждый тест опирается на конкретные фразы и требования из Документа: сроки, процедуры, обязанности, полномочия, контроль, виды мер реагирования; избегай тем, которых нет в Документе.
-
-Корректный вариант должен точно соответствовать норме/требованию из Документа (указывай номер статьи или наименование акта только если оно явно присутствует во входном тексте).
-
-Не добавляй объяснений, ссылок, цитат и правовых комментариев вне правильного ответа-буквы."""
-
-        # If file_url is provided, use responses API with file support
-        if file_url:
-            logger.info(f"Generating {num_questions} test questions from file: {file_url}")
-
-            response = client.responses.create(
-                model="gpt-5",
-                input=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "input_text",
-                                "text": prompt_text
-                            },
-                            {
-                                "type": "input_file",
-                                "file_url": file_url
-                            }
-                        ]
-                    }
-                ]
-            )
-            response_text = response.output_text
-
-        # If text is provided, use standard chat completion
-        else:
-            logger.info(f"Generating {num_questions} test questions for text of length: {len(text)}")
-
-            full_prompt = f"{prompt_text}\n\nТекст для создания вопросов:\n{text}"
-
-            response = client.responses.create(
-                model="gpt-5",
-                input=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "input_text",
-                                "text": prompt_text
-                            },
-                            {
-                                "type": "input_text",
-                                "text": text
-                            }
-                        ]
-                    }
-                ]
-            )
-            response_text = response.output_text
-
-        # Parse the text format response
-        try:
-            questions = _parse_situational_tests(response_text)
-
-            # Validate the structure
-            for q in questions:
-                if not all(key in q for key in ["question", "options", "correct_answer"]):
-                    raise ValueError("Invalid question structure")
-                if len(q["options"]) != 4:
-                    raise ValueError("Each question must have exactly 4 options")
-
-            logger.info(f"Generated {len(questions)} test questions successfully")
-            return questions
-
-        except Exception as e:
-            logger.error(f"Failed to parse test response: {response_text}")
-            raise Exception(f"Failed to parse test questions: {str(e)}")
+        return {
+            "connected": True,
+            "available_models": available_models,
+            "model_available": model_available,
+            "requested_model": model,
+            "error": None
+        }
 
     except Exception as e:
-        logger.error(f"Error generating test: {str(e)}")
-        raise Exception(f"Failed to generate test: {str(e)}")
+        error_msg = f"Failed to connect to Ollama: {str(e)}"
+        logger.error(error_msg)
+        return {
+            "connected": False,
+            "available_models": [],
+            "model_available": False,
+            "requested_model": model,
+            "error": error_msg
+        }
 
 
-def extract_text_from_file(file_path: str, file_type: str) -> str:
+def chunk_text(text: str, max_chunk_size: int = 8000) -> list[str]:
     """
-    Extract text from various file formats.
+    Split text into chunks for processing long documents.
 
     Args:
-        file_path: Path to the file
-        file_type: Type of file (txt, docx, pdf)
+        text: Text to split
+        max_chunk_size: Maximum size of each chunk in characters
 
     Returns:
-        str: Extracted text
+        List of text chunks
+    """
+    if len(text) <= max_chunk_size:
+        return [text]
+
+    chunks = []
+    current_chunk = ""
+
+    # Split by paragraphs
+    paragraphs = text.split("\n\n")
+
+    for paragraph in paragraphs:
+        if len(current_chunk) + len(paragraph) <= max_chunk_size:
+            current_chunk += paragraph + "\n\n"
+        else:
+            if current_chunk:
+                chunks.append(current_chunk.strip())
+            current_chunk = paragraph + "\n\n"
+
+    if current_chunk:
+        chunks.append(current_chunk.strip())
+
+    logger.info(f"Text split into {len(chunks)} chunks")
+    return chunks
+
+
+def clean_large_text_with_ollama(
+    text: str,
+    ollama_url: str = "http://localhost:11434",
+    model: str = "llama3",
+    temperature: float = 0.1,
+    max_chunk_size: int = 8000
+) -> Dict[str, any]:
+    """
+    Clean large text by processing it in chunks.
+
+    Args:
+        text: The text to clean
+        ollama_url: URL of the Ollama server
+        model: Name of the Ollama model to use
+        temperature: Temperature for generation
+        max_chunk_size: Maximum size of each chunk
+
+    Returns:
+        Dict with cleaned text and metadata
     """
     try:
-        if file_type == "txt":
-            with open(file_path, 'r', encoding='utf-8') as f:
-                return f.read()
+        # Split text into chunks
+        chunks = chunk_text(text, max_chunk_size)
 
-        elif file_type == "docx":
-            from docx import Document
-            doc = Document(file_path)
-            return "\n".join([paragraph.text for paragraph in doc.paragraphs])
+        if len(chunks) == 1:
+            # Process single chunk
+            return clean_text_with_ollama(text, ollama_url, model, temperature)
 
-        elif file_type == "pdf":
-            from PyPDF2 import PdfReader
-            reader = PdfReader(file_path)
-            text = ""
-            for page in reader.pages:
-                text += page.extract_text()
-            return text
+        # Process multiple chunks
+        logger.info(f"Processing {len(chunks)} chunks")
+        cleaned_chunks = []
+        total_original_length = 0
+        total_cleaned_length = 0
 
-        else:
-            raise ValueError(f"Unsupported file type: {file_type}")
+        for i, chunk in enumerate(chunks, 1):
+            logger.info(f"Processing chunk {i}/{len(chunks)}")
+            result = clean_text_with_ollama(chunk, ollama_url, model, temperature)
+
+            if not result["success"]:
+                return result
+
+            cleaned_chunks.append(result["cleaned_text"])
+            total_original_length += result["original_length"]
+            total_cleaned_length += result["cleaned_length"]
+
+        # Combine cleaned chunks
+        cleaned_text = "\n\n".join(cleaned_chunks)
+
+        logger.info(f"All chunks processed successfully")
+
+        return {
+            "cleaned_text": cleaned_text,
+            "original_length": total_original_length,
+            "cleaned_length": total_cleaned_length,
+            "llm_model": model,
+            "success": True,
+            "error": None,
+            "chunks_processed": len(chunks)
+        }
 
     except Exception as e:
-        logger.error(f"Error extracting text from file: {str(e)}")
-        raise Exception(f"Failed to extract text: {str(e)}")
+        error_msg = f"Error processing large text: {str(e)}"
+        logger.error(error_msg)
+        return {
+            "cleaned_text": None,
+            "original_length": len(text),
+            "cleaned_length": 0,
+            "llm_model": model,
+            "success": False,
+            "error": error_msg
+        }
+
+
+# ============================================================================
+# UNIVERSAL LLM FUNCTIONS (Supports both Ollama and Cloud providers)
+# ============================================================================
+
+def clean_text_with_llm(
+    text: str,
+    provider: ProviderType = "ollama",
+    model: str = "llama3",
+    temperature: float = 0.1,
+    ollama_url: str = "http://localhost:11434",
+    base_url: Optional[str] = None,
+    api_key: Optional[str] = None
+) -> Dict[str, any]:
+    """
+    Universal function to clean text with LLM (supports Ollama and cloud providers).
+
+    Args:
+        text: The text to clean
+        provider: LLM provider ('ollama', 'openrouter', 'openai', 'groq', 'cloud')
+        model: Name of the model to use
+        temperature: Temperature for generation
+        ollama_url: URL for Ollama (if provider is 'ollama')
+        base_url: Base URL for cloud providers
+        api_key: API key for cloud providers
+
+    Returns:
+        Dict with cleaned text and metadata
+    """
+    from app.services.llm_service_cloud import clean_text_with_cloud_llm
+
+    logger.info(f"Using LLM provider: {provider}")
+
+    if provider == "ollama":
+        # Use local Ollama
+        if len(text) > 8000:
+            return clean_large_text_with_ollama(text, ollama_url, model, temperature)
+        else:
+            return clean_text_with_ollama(text, ollama_url, model, temperature)
+    else:
+        # Use cloud provider (openrouter, openai, groq, etc.)
+        if not base_url or not api_key:
+            return {
+                "cleaned_text": None,
+                "original_length": len(text),
+                "cleaned_length": 0,
+                "llm_model": model,
+                "success": False,
+                "error": "base_url and api_key are required for cloud providers"
+            }
+
+        if len(text) > 12000:
+            from app.services.llm_service_cloud import clean_large_text_with_cloud_llm
+            return clean_large_text_with_cloud_llm(
+                text, CLEANING_PROMPT, base_url, api_key, model, temperature
+            )
+        else:
+            return clean_text_with_cloud_llm(
+                text, CLEANING_PROMPT, base_url, api_key, model, temperature
+            )
+
+
+def test_llm_connection(
+    provider: ProviderType = "ollama",
+    model: str = "llama3",
+    ollama_url: str = "http://localhost:11434",
+    base_url: Optional[str] = None,
+    api_key: Optional[str] = None
+) -> Dict[str, any]:
+    """
+    Test connection to LLM service (Ollama or cloud).
+
+    Args:
+        provider: LLM provider
+        model: Model name
+        ollama_url: Ollama URL (for local)
+        base_url: Base URL (for cloud)
+        api_key: API key (for cloud)
+
+    Returns:
+        Dict with connection status
+    """
+    from app.services.llm_service_cloud import test_cloud_llm_connection
+
+    if provider == "ollama":
+        return test_ollama_connection(ollama_url, model)
+    else:
+        if not base_url or not api_key:
+            return {
+                "connected": False,
+                "model_available": False,
+                "requested_model": model,
+                "error": "base_url and api_key are required for cloud providers"
+            }
+        return test_cloud_llm_connection(base_url, api_key, model)
+
+
+# ============================================================================
+# RE-EXPORT OPENAI FUNCTIONS (for backwards compatibility)
+# ============================================================================
+from app.services.openai_functions import (
+    generate_summary,
+    generate_test,
+    extract_text_from_file,
+    _parse_situational_tests
+)
+
+def clean_text_with_ner_and_llm(
+    text: str,
+    provider: ProviderType = "ollama",
+    model: str = "llama3",
+    temperature: float = 0.1,
+    ollama_url: str = "http://localhost:11434",
+    base_url: Optional[str] = None,
+    api_key: Optional[str] = None,
+    use_ner: bool = True
+) -> Dict[str, any]:
+    """
+    Two-stage pipeline: NER preprocessing + LLM finalization.
+
+    This is the recommended approach for best quality.
+
+    Args:
+        text: Original text to clean
+        provider: LLM provider
+        model: Model name
+        temperature: Temperature for LLM
+        ollama_url: Ollama URL (for local)
+        base_url: Base URL (for cloud)
+        api_key: API key (for cloud)
+        use_ner: Whether to use NER preprocessing (default: True)
+
+    Returns:
+        Dict with cleaned text, stats, and metadata
+    """
+    try:
+        if use_ner:
+            # Stage 1: NER Preprocessing
+            logger.info("Stage 1: NER preprocessing...")
+            from app.services.ner_service import preprocess_with_ner
+
+            ner_result = preprocess_with_ner(text)
+
+            if not ner_result["success"]:
+                logger.warning(f"NER preprocessing failed: {ner_result['error']}")
+                logger.info("Falling back to direct LLM cleaning...")
+                preprocessed_text = text
+                ner_stats = {}
+            else:
+                preprocessed_text = ner_result["preprocessed_text"]
+                ner_stats = ner_result["stats"]
+                logger.info(f"NER preprocessing complete. Replacements: {ner_stats['total_replacements']}")
+        else:
+            preprocessed_text = text
+            ner_stats = {}
+
+        # Stage 2: LLM Finalization
+        logger.info("Stage 2: LLM finalization...")
+
+        # Choose prompt based on whether NER was used
+        prompt_template = LLM_FINALIZATION_PROMPT if use_ner else CLEANING_PROMPT
+
+        # Use appropriate cleaning function
+        from app.services.llm_service_cloud import clean_text_with_cloud_llm
+
+        if provider == "ollama":
+            # Use Ollama
+            prompt = prompt_template.format(text=preprocessed_text)
+
+            if len(preprocessed_text) > 8000:
+                # For large texts, we need to handle chunking differently
+                llm_result = clean_large_text_with_ollama(
+                    preprocessed_text, ollama_url, model, temperature
+                )
+            else:
+                llm_result = clean_text_with_ollama(
+                    preprocessed_text, ollama_url, model, temperature
+                )
+        else:
+            # Use cloud provider
+            if not base_url or not api_key:
+                return {
+                    "cleaned_text": None,
+                    "original_length": len(text),
+                    "cleaned_length": 0,
+                    "llm_model": model,
+                    "success": False,
+                    "error": "base_url and api_key are required for cloud providers",
+                    "ner_stats": ner_stats
+                }
+
+            llm_result = clean_text_with_cloud_llm(
+                preprocessed_text, prompt_template, base_url, api_key, model, temperature
+            )
+
+        if not llm_result["success"]:
+            return {
+                "cleaned_text": None,
+                "original_length": len(text),
+                "cleaned_length": 0,
+                "llm_model": model,
+                "success": False,
+                "error": llm_result["error"],
+                "ner_stats": ner_stats
+            }
+
+        # Combine results
+        result = {
+            "cleaned_text": llm_result["cleaned_text"],
+            "original_text": text,
+            "preprocessed_text": preprocessed_text if use_ner else None,
+            "original_length": len(text),
+            "cleaned_length": len(llm_result["cleaned_text"]),
+            "llm_model": model,
+            "success": True,
+            "error": None,
+            "ner_stats": ner_stats,
+            "pipeline_used": "NER + LLM" if use_ner else "LLM Only"
+        }
+
+        logger.info(f"Two-stage cleaning complete. Original: {result['original_length']}, Final: {result['cleaned_length']}")
+        if use_ner:
+            logger.info(f"NER replaced {ner_stats.get('total_replacements', 0)} entities")
+
+        return result
+
+    except Exception as e:
+        error_msg = f"Error in two-stage cleaning pipeline: {str(e)}"
+        logger.error(error_msg)
+        return {
+            "cleaned_text": None,
+            "original_length": len(text),
+            "cleaned_length": 0,
+            "llm_model": model,
+            "success": False,
+            "error": error_msg,
+            "ner_stats": ner_stats if 'ner_stats' in locals() else {}
+        }
+
+
+__all__ = [
+    'CLEANING_PROMPT',
+    'LLM_FINALIZATION_PROMPT',
+    'clean_text_with_ollama',
+    'test_ollama_connection',
+    'chunk_text',
+    'clean_large_text_with_ollama',
+    'clean_text_with_llm',
+    'clean_text_with_ner_and_llm',
+    'test_llm_connection',
+    'generate_summary',
+    'generate_test',
+    'extract_text_from_file',
+]
+

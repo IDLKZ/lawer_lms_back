@@ -3,6 +3,7 @@ from app.schemas.course import Course, CourseCreate, CourseUpdate, CourseSummary
 from app.schemas.summary import Summary, SummaryCreate
 from app.schemas.test import Test, TestCreate, Question, QuestionForStudent, TestForStudent, TestSubmit, AnswerSubmit
 from app.schemas.test_result import TestResult, TestSubmitResponse
+from app.schemas.case import Case, CaseCreate, CaseUpdate, CaseSummary, PDFProcessingResult, CaseFromPDF, PDFValidationResult
 
 __all__ = [
     # User
@@ -31,4 +32,12 @@ __all__ = [
     # TestResult
     "TestResult",
     "TestSubmitResponse",
+    # Case
+    "Case",
+    "CaseCreate",
+    "CaseUpdate",
+    "CaseSummary",
+    "PDFProcessingResult",
+    "CaseFromPDF",
+    "PDFValidationResult",
 ]

@@ -3,6 +3,7 @@ from app.models.course import Course, CourseStatus
 from app.models.summary import Summary
 from app.models.test import Test
 from app.models.test_result import TestResult
+from app.models.case import Case, CaseStatus
 
 __all__ = [
     "User",
@@ -12,4 +13,6 @@ __all__ = [
     "Summary",
     "Test",
     "TestResult",
+    "Case",
+    "CaseStatus",
 ]

@@ -23,3 +23,6 @@ class User(Base):
     # Relationships
     courses = relationship("Course", back_populates="creator")
     test_results = relationship("TestResult", back_populates="student")
+    cases = relationship("Case", back_populates="creator")
+    case_tests = relationship("CaseTest", back_populates="creator")
+    case_results = relationship("CaseResult", back_populates="student")
